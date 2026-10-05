@@ -1532,7 +1532,8 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                 var sourceQuality = first?.Quality?.Quality ?? Qualities.Quality.Unknown;
                 var qualityProfile = author.GetQualityProfileForQuality(sourceQuality);
                 var targetQuality = QualityConversionHelper.GetPlannedConversionTarget(author, first?.Quality);
-                if (targetQuality != Qualities.Quality.M4B)
+                var mergeMultiPartM4b = QualityConversionHelper.ShouldMergeMultiPartM4b(qualityProfile, first?.Quality);
+                if (targetQuality != Qualities.Quality.M4B && !mergeMultiPartM4b)
                 {
                     return (bookDecisions, null, false, null);
                 }
@@ -1549,7 +1550,28 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     return (bookDecisions, null, false, null);
                 }
 
-                if (inputFiles.All(p => Path.GetExtension(p).Equals(".m4b", StringComparison.OrdinalIgnoreCase)))
+                if (inputFiles.All(p => Path.GetExtension(p).Equals(".m4b", StringComparison.OrdinalIgnoreCase)) &&
+                    (inputFiles.Length == 1 || !mergeMultiPartM4b))
+                {
+                    return (bookDecisions, null, false, null);
+                }
+
+                var isOptionalMerge = targetQuality != Qualities.Quality.M4B;
+
+                (List<ImportDecision<LocalBook>> Decisions, string WorkFolder, bool Failed, string Error) ConversionFailed(string error, string fallbackCleanupRoot = null)
+                {
+                    if (!isOptionalMerge)
+                    {
+                        return (bookDecisions, null, true, error);
+                    }
+
+                    _logger.Warn("[CONVERSION] Could not merge multi-part M4B for '{0}'; importing the parts unmerged. {1}", book.Title, error);
+                    _conversionTrackingService?.Clear(downloadClientItem.DownloadId);
+                    CleanupConversionWorkFolder(fallbackCleanupRoot);
+                    return (bookDecisions, null, false, null);
+                }
+
+                if (hasRejectedTrackedDownloadDecisions && isOptionalMerge)
                 {
                     return (bookDecisions, null, false, null);
                 }
@@ -1571,7 +1593,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     var error = "Conversion to M4B is enabled, but one or more files are not compatible with the M4B converter.";
                     _conversionTrackingService?.Fail(downloadClientItem.DownloadId, error);
                     PublishConversionFailed(first, inputFiles, book, author, convertedQuality, null, error, downloadClientItem);
-                    return (bookDecisions, null, true, error);
+                    return ConversionFailed(error);
                 }
 
                 var outputName = GetSafeConvertedFileName(inputFiles.Length == 1 ? Path.GetFileNameWithoutExtension(inputFiles[0]) : book.Title);
@@ -1588,7 +1610,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                         var error = "Unable to determine destination folder for converted M4B.";
                         _conversionTrackingService?.Fail(downloadClientItem.DownloadId, error);
                         PublishConversionFailed(first, inputFiles, book, author, convertedQuality, null, error, downloadClientItem);
-                        return (bookDecisions, null, true, error);
+                        return ConversionFailed(error);
                     }
 
                     var destinationConflict = GetConversionDestinationConflictReason(finalDestinationPath, book, qualityProfile, replaceExisting, manualReplaceExisting);
@@ -1596,7 +1618,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     {
                         _conversionTrackingService?.Fail(downloadClientItem.DownloadId, destinationConflict);
                         PublishConversionFailed(first, inputFiles, book, author, convertedQuality, null, destinationConflict, downloadClientItem);
-                        return (bookDecisions, null, true, destinationConflict);
+                        return ConversionFailed(destinationConflict);
                     }
 
                     var downloadFolderName = GetSafeConvertedFileName(downloadClientItem.DownloadId ?? Guid.NewGuid().ToString("N"));
@@ -1620,13 +1642,14 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                         _configService?.AudiobookConversionTagMode);
                     var sourceDuration = GetAudiobookConversionSourceDuration(inputFiles);
                     TryApplyMatchedEditionChapters(tagOptions, first.Edition, sourceDuration, book);
+                    var noConversion = isOptionalMerge && TryApplyMultiPartM4bMergeSources(tagOptions, bookDecisions, inputFiles, book);
                     TryApplySourceSidecarCover(tagOptions, inputFiles, book, first.Edition);
                     ApplyConversionCoverFallback(tagOptions, book, first.Edition);
                     ConversionTagProposalBuilder.RefreshManifestJson(tagOptions, bookDecisions.Select(d => d.Item));
                     var audioBitrate = GetAudiobookConversionBitrate(inputFiles);
                     var audioChannels = GetAudiobookConversionAudioChannels();
 
-                    if (TryFindReusableConversionArtifact(workRoot, inputFiles, convertedQuality, tagOptions, audioBitrate, audioChannels, out var reusableOutputPath))
+                    if (TryFindReusableConversionArtifact(workRoot, inputFiles, convertedQuality, tagOptions, audioBitrate, audioChannels, noConversion, out var reusableOutputPath))
                     {
                         _conversionTrackingService?.Start(downloadClientItem.DownloadId, Qualities.Quality.M4B.Id, Qualities.Quality.M4B.Name, "Using retained M4B");
                         _conversionTrackingService?.Progress(downloadClientItem.DownloadId, 97m, "Using retained M4B");
@@ -1651,14 +1674,16 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                             var error = "The completed conversion artifact is no longer valid for the current source files. Retry import to rebuild it.";
                             _conversionJobService.Fail(downloadClientItem.DownloadId, error);
                             PublishConversionFailed(first, inputFiles, book, author, convertedQuality, existingJob.OutputPath, error, downloadClientItem);
-                            return (bookDecisions, null, true, error);
+                            return ConversionFailed(error, existingJob.WorkRoot ?? workRoot);
                         }
 
                         if (existingJob.Status == ConversionJobStatus.Failed || existingJob.Status == ConversionJobStatus.Cancelled)
                         {
                             var error = existingJob.Error ?? existingJob.Message ?? "M4B conversion did not complete.";
                             PublishConversionFailed(first, inputFiles, book, author, convertedQuality, existingJob.OutputPath, error, downloadClientItem);
-                            return (bookDecisions, null, true, error);
+                            return existingJob.Status == ConversionJobStatus.Failed
+                                ? ConversionFailed(error, existingJob.WorkRoot ?? workRoot)
+                                : (bookDecisions, null, true, error);
                         }
                     }
 
@@ -1667,7 +1692,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     {
                         _conversionTrackingService?.Fail(downloadClientItem.DownloadId, freeSpaceError);
                         PublishConversionFailed(first, inputFiles, book, author, convertedQuality, outputPath, freeSpaceError, downloadClientItem);
-                        return (bookDecisions, null, true, freeSpaceError);
+                        return ConversionFailed(freeSpaceError);
                     }
 
                     CleanupConversionWorkFolder(workRoot);
@@ -1682,7 +1707,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                         {
                             var error = "Unable to capture stable source-file identities for M4B conversion.";
                             _conversionJobService.Fail(downloadClientItem.DownloadId, error);
-                            return (bookDecisions, workRoot, true, error);
+                            return isOptionalMerge ? ConversionFailed(error, workRoot) : (bookDecisions, workRoot, true, error);
                         }
 
                         _conversionJobService.Enqueue(new ConversionJobRequest
@@ -1703,6 +1728,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                             TargetQualityName = convertedQuality.Quality.Name,
                             AudioBitrate = audioBitrate,
                             AudioChannels = audioChannels,
+                            NoConversion = noConversion,
                             ExpectedSourceDurationTicks = sourceDuration.Ticks,
                             TagSignature = GetConversionTagSignature(tagOptions),
                             TagOptions = tagOptions
@@ -1730,6 +1756,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                             TempDirectory = workFolder,
                             AudioBitrate = audioBitrate,
                             AudioChannels = audioChannels,
+                            NoConversion = noConversion,
                             ExpectedSourceDuration = sourceDuration,
                             Jobs = threadPlan.ParallelFiles,
                             FfmpegThreads = threadPlan.FfmpegThreads,
@@ -1761,7 +1788,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
 
                         if (result.RetainOutputOnFailure && DestinationFileExists(outputPath))
                         {
-                            WriteConversionArtifactManifest(workFolder, outputPath, inputFiles, convertedQuality, tagOptions, audioBitrate, audioChannels);
+                            WriteConversionArtifactManifest(workFolder, outputPath, inputFiles, convertedQuality, tagOptions, audioBitrate, audioChannels, noConversion);
                             error = $"{error} Converted file retained at: {outputPath}";
                         }
 
@@ -1772,12 +1799,12 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                             CleanupConversionWorkFolder(workRoot);
                         }
 
-                        return (bookDecisions, null, true, error);
+                        return ConversionFailed(error, workRoot);
                     }
 
                     _conversionTrackingService?.Progress(downloadClientItem.DownloadId, 97m, "Finalizing M4B");
 
-                    WriteConversionArtifactManifest(workFolder, outputPath, inputFiles, convertedQuality, tagOptions, audioBitrate, audioChannels);
+                    WriteConversionArtifactManifest(workFolder, outputPath, inputFiles, convertedQuality, tagOptions, audioBitrate, audioChannels, noConversion);
                     var convertedLocalBook = CreateGeneratedConversionLocalBook(first, bookDecisions, outputPath, inputFiles, convertedQuality, tagOptions);
 
                     _conversionTrackingService?.Progress(downloadClientItem.DownloadId, 98m, "Preparing import");
@@ -1800,7 +1827,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     _conversionTrackingService?.Fail(downloadClientItem.DownloadId, ex.Message);
                     PublishConversionFailed(first, inputFiles, book, author, convertedQuality, outputPath, "M4B conversion failed: " + ex.Message, downloadClientItem);
                     CleanupConversionWorkFolder(workRoot ?? workFolder);
-                    return (bookDecisions, null, true, "M4B conversion failed: " + ex.Message);
+                    return ConversionFailed("M4B conversion failed: " + ex.Message);
                 }
             }
 
@@ -1856,6 +1883,27 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                 tagOptions.ChaptersTxtContent = BuildChaptersTxt(chapters, sourceDuration);
                 tagOptions.ProviderChapterCount = chapters.Count;
                 _logger.Debug("[CONVERSION] Matched provider chapters will be stamped into converted M4B for '{0}' ({1} chapters).", book?.Title ?? edition.Title, chapters.Count);
+            }
+
+            private bool TryApplyMultiPartM4bMergeSources(ConversionTagOptions tagOptions, IEnumerable<ImportDecision<LocalBook>> bookDecisions, string[] inputFiles, Book book)
+            {
+                ConversionTagProposalBuilder.ApplyMultiPartMergeTags(tagOptions, bookDecisions.Select(d => d.Item));
+
+                var mergeSources = _m4bConversionService.ProbeMergeSources(inputFiles);
+                if (tagOptions != null && mergeSources.ChaptersTxtContent.IsNotNullOrWhiteSpace())
+                {
+                    tagOptions.ChaptersTxtContent = mergeSources.ChaptersTxtContent;
+                    tagOptions.ProviderChapterCount = null;
+                    tagOptions.UseFilenamesAsChapters = false;
+                    _logger.Debug("[CONVERSION] Embedded chapters from {0} parts will be carried into the merged M4B for '{1}' ({2} chapters).", inputFiles.Length, book?.Title, mergeSources.EmbeddedChapterCount);
+                }
+
+                if (!mergeSources.CanCopyAudio)
+                {
+                    _logger.Debug("[CONVERSION] Multi-part M4B parts for '{0}' differ in codec, sample rate or channels; re-encoding while merging.", book?.Title);
+                }
+
+                return mergeSources.CanCopyAudio;
             }
 
             private void ApplyConversionCoverFallback(ConversionTagOptions tagOptions, Book book, Edition matchedEdition)
@@ -2463,7 +2511,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                 return existingEdition?.BookId == book.Id;
             }
 
-            private bool TryFindReusableConversionArtifact(string workRoot, string[] inputFiles, QualityModel targetQuality, ConversionTagOptions tagOptions, int audioBitrate, int audioChannels, out string outputPath)
+            private bool TryFindReusableConversionArtifact(string workRoot, string[] inputFiles, QualityModel targetQuality, ConversionTagOptions tagOptions, int audioBitrate, int audioChannels, bool noConversion, out string outputPath)
             {
                 outputPath = null;
                 if (workRoot.IsNullOrWhiteSpace() || !Directory.Exists(workRoot))
@@ -2501,6 +2549,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                             manifest.TargetQualityId != targetQuality?.Quality?.Id ||
                             manifest.AudioBitrate != audioBitrate ||
                             manifest.AudioChannels != audioChannels ||
+                            manifest.NoConversion != noConversion ||
                             !string.Equals(manifest.TagSignature, tagSignature, StringComparison.Ordinal) ||
                             !ConversionArtifactSourcesMatch(currentSources, manifest.Sources))
                         {
@@ -2533,7 +2582,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                 return false;
             }
 
-            private void WriteConversionArtifactManifest(string workFolder, string outputPath, string[] inputFiles, QualityModel targetQuality, ConversionTagOptions tagOptions, int audioBitrate, int audioChannels)
+            private void WriteConversionArtifactManifest(string workFolder, string outputPath, string[] inputFiles, QualityModel targetQuality, ConversionTagOptions tagOptions, int audioBitrate, int audioChannels, bool noConversion)
             {
                 try
                 {
@@ -2551,6 +2600,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                         TargetQualityName = targetQuality?.Quality?.Name,
                         AudioBitrate = audioBitrate,
                         AudioChannels = audioChannels,
+                        NoConversion = noConversion,
                         TagMode = tagOptions?.Mode,
                         TagSignature = GetConversionTagSignature(tagOptions),
                         Sources = sources
@@ -2612,7 +2662,7 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     return string.Empty;
                 }
 
-                return string.Join("\u001f",
+                var signature = string.Join("\u001f",
                     tagOptions.Mode,
                     tagOptions.Name,
                     tagOptions.Album,
@@ -2634,6 +2684,10 @@ namespace NzbDrone.Core.MediaFiles.BookImport
                     tagOptions.ProviderChapterCount?.ToString(CultureInfo.InvariantCulture),
                     tagOptions.CoverPolicySignature,
                     HashString(tagOptions.ChaptersTxtContent));
+
+                return tagOptions.RemoveTags?.Count > 0
+                    ? signature + "\u001f" + string.Join(",", tagOptions.RemoveTags)
+                    : signature;
             }
 
             private static string HashString(string value)
