@@ -81,6 +81,8 @@ namespace NzbDrone.Core.Books
             PagedBookResource GetBooksPaged(int offset, int pageSize, string sortKey, string sortDirection, bool includeUnmonitored = false, string mediaType = null, bool? downloaded = null);
             PagedBookResource GetBooksPaged(int offset, int pageSize, string sortKey, string sortDirection, bool includeUnmonitored, string mediaType, bool? downloaded, bool? monitored, bool? missing = null, bool? wanted = null) => GetBooksPaged(offset, pageSize, sortKey, sortDirection, includeUnmonitored, mediaType, downloaded);
             List<int> GetBookIds(bool includeUnmonitored = false, string mediaType = null, bool? downloaded = null, bool? monitored = null, bool? missing = null, bool? wanted = null) => throw new NotImplementedException();
+            List<AuthorBookCount> GetBookshelfAuthorCounts(BookMediaType mediaType) => throw new NotImplementedException();
+            List<Book> GetBooksForBookshelf(IEnumerable<int> authorIds, BookMediaType mediaType) => throw new NotImplementedException();
         }
 
     public class BookService : IBookService,
@@ -2222,38 +2224,45 @@ namespace NzbDrone.Core.Books
         {
             _logger.Debug("[DISPLAY-DEBUG] GetBooksForDisplay called with authorId={0}, mediaType={1}", authorId, mediaType);
 
+            BookMediaType? targetMediaType = null;
+
+            if (!string.IsNullOrEmpty(mediaType))
+            {
+                targetMediaType = mediaType.ToLower() == "ebook" ? BookMediaType.Ebook : BookMediaType.Audiobook;
+
+                // CRITICAL: Check if root folder exists for this media type
+                // If no root folder, return empty list (GUI shows nothing)
+                if (!HasRootFolderForMediaType(targetMediaType.Value))
+                {
+                    _logger.Debug("[DISPLAY-DEBUG] No root folder configured for {0}, returning empty list", mediaType);
+                    return new List<Book>();
+                }
+            }
+
             List<Book> allBooks;
 
             if (authorId.HasValue)
             {
                 allBooks = GetBooksByAuthor(authorId.Value);
                 _logger.Debug("[DISPLAY-DEBUG] GetBooksByAuthor returned {0} books for author {1}", allBooks.Count, authorId.Value);
+
+                if (targetMediaType.HasValue)
+                {
+                    allBooks = allBooks.Where(b => b.MediaType == targetMediaType.Value).ToList();
+                    _logger.Debug("[DISPLAY-DEBUG] Filtered to {0} books with MediaType={1}", allBooks.Count, targetMediaType.Value);
+                }
+            }
+            else if (targetMediaType.HasValue)
+            {
+                // The general list can be the whole library, so filter in SQL. Series links are
+                // left to the API mapper, which loads them for the books it returns.
+                allBooks = _bookRepository.GetBooksByMediaType(targetMediaType.Value);
+                _logger.Debug("[DISPLAY-DEBUG] GetBooksByMediaType returned {0} books with MediaType={1}", allBooks.Count, targetMediaType.Value);
             }
             else
             {
-                allBooks = GetAllBooks();
-                _logger.Debug("[DISPLAY-DEBUG] GetAllBooks returned {0} books", allBooks.Count);
-            }
-
-            // NEW DUAL-INSTANCE LOGIC: Filter by MediaType enum if specified
-            if (!string.IsNullOrEmpty(mediaType))
-            {
-                var targetMediaType = mediaType.ToLower() == "ebook" ? BookMediaType.Ebook : BookMediaType.Audiobook;
-                allBooks = allBooks.Where(b => b.MediaType == targetMediaType).ToList();
-                _logger.Debug("[DISPLAY-DEBUG] Filtered to {0} books with MediaType={1}", allBooks.Count, targetMediaType);
-
-                // CRITICAL: Check if root folder exists for this media type
-                // If no root folder, return empty list (GUI shows nothing)
-                var rootFolders = _rootFolderService.All();
-                var hasRootFolderForType = targetMediaType == BookMediaType.Audiobook
-                    ? rootFolders.Any(rf => rf.FolderType == FolderType.Audiobook || rf.FolderType == FolderType.Mixed)
-                    : rootFolders.Any(rf => rf.FolderType == FolderType.Ebook || rf.FolderType == FolderType.Mixed);
-
-                if (!hasRootFolderForType)
-                {
-                    _logger.Debug("[DISPLAY-DEBUG] No root folder configured for {0}, returning empty list", mediaType);
-                    return new List<Book>();
-                }
+                allBooks = _bookRepository.All().ToList();
+                _logger.Debug("[DISPLAY-DEBUG] Loaded all {0} books", allBooks.Count);
             }
 
             // Bulk API/index sync path is intentionally lean: one monitored edition per book, no files.
@@ -2264,7 +2273,7 @@ namespace NzbDrone.Core.Books
                 var bookIdSet = bookIds.ToHashSet();
                 var allEditions = authorId.HasValue
                     ? _editionService.GetEditionsByBook(bookIds)
-                    : _editionService.GetAllMonitoredEditions().Where(e => e != null && bookIdSet.Contains(e.BookId)).ToList();
+                    : _editionService.GetMonitoredEditionsForBookList(targetMediaType).Where(e => e != null && bookIdSet.Contains(e.BookId)).ToList();
                 var editionsByBook = allEditions.GroupBy(e => e.BookId).ToDictionary(g => g.Key, g => g.ToList());
 
                 var filesByEdition = new Dictionary<int, List<BookFile>>();
@@ -2306,6 +2315,69 @@ namespace NzbDrone.Core.Books
             // With dual-instance architecture, just return the filtered books
             _logger.Debug("[DISPLAY-DEBUG] Returning {0} books for display", allBooks.Count);
             return allBooks;
+        }
+
+        public List<AuthorBookCount> GetBookshelfAuthorCounts(BookMediaType mediaType)
+        {
+            if (!HasRootFolderForMediaType(mediaType))
+            {
+                return new List<AuthorBookCount>();
+            }
+
+            return _bookRepository.GetBookCountsByAuthor(mediaType);
+        }
+
+        public List<Book> GetBooksForBookshelf(IEnumerable<int> authorIds, BookMediaType mediaType)
+        {
+            if (!HasRootFolderForMediaType(mediaType))
+            {
+                return new List<Book>();
+            }
+
+            var books = _bookRepository.GetBooksByAuthorIds(authorIds, mediaType);
+            if (!books.Any())
+            {
+                return books;
+            }
+
+            // Same lean shape as the general book list: monitored editions only, no files.
+            var bookIds = books.Select(b => b.Id).ToList();
+            var monitoredEditions = _editionService.GetEditionsByBook(bookIds)
+                .Where(e => e.Monitored)
+                .ToList();
+            var editionsByBook = monitoredEditions
+                .GroupBy(e => e.BookId)
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            foreach (var book in books)
+            {
+                book.BookFiles = new List<BookFile>();
+
+                if (editionsByBook.TryGetValue(book.Id, out var bookEditions))
+                {
+                    foreach (var edition in bookEditions)
+                    {
+                        edition.BookFiles = null;
+                    }
+
+                    book.Editions = bookEditions;
+                }
+                else
+                {
+                    book.Editions = new List<Edition>();
+                }
+            }
+
+            return books;
+        }
+
+        private bool HasRootFolderForMediaType(BookMediaType mediaType)
+        {
+            var rootFolders = _rootFolderService.All();
+
+            return mediaType == BookMediaType.Audiobook
+                ? rootFolders.Any(rf => rf.FolderType == FolderType.Audiobook || rf.FolderType == FolderType.Mixed)
+                : rootFolders.Any(rf => rf.FolderType == FolderType.Ebook || rf.FolderType == FolderType.Mixed);
         }
 
         public List<Book> GetBooksByBaseId(string baseBookId)
