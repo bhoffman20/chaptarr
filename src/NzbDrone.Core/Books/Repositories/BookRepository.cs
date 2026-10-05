@@ -1098,11 +1098,17 @@ namespace NzbDrone.Core.Books
             var countBuilder = CreatePagedBooksBuilder(includeUnmonitored, mediaType, downloaded, monitored, missing, wanted);
             var countTemplate = countBuilder.AddTemplate($"SELECT COUNT(*) FROM \"{tableName}\" /**where**/");
 
+            int totalCount;
+            List<int> pageIds;
+
             using (var conn = _database.OpenConnection())
             {
-                var totalCount = conn.QuerySingle<int>(countTemplate.RawSql, countTemplate.Parameters);
+                totalCount = conn.QuerySingle<int>(countTemplate.RawSql, countTemplate.Parameters);
                 var builder = CreatePagedBooksBuilder(includeUnmonitored, mediaType, downloaded, monitored, missing, wanted);
-                builder.Select(typeof(Book));
+
+                // Sort and page only the IDs. Sorting whole rows means carrying every column of the
+                // library through the sort, which spills to disk on large libraries.
+                builder.Select($"\"{tableName}\".\"Id\"");
 
                 if (sortKeysJoiningFileStatistics.Contains(normalizedSortKey))
                 {
@@ -1136,16 +1142,40 @@ namespace NzbDrone.Core.Books
                     $"SELECT /**select**/ FROM \"{tableName}\" /**join**/ /**innerjoin**/ /**leftjoin**/ /**where**/ /**groupby**/ /**having**/ /**orderby**/ LIMIT {pageSize} OFFSET {offset}"
                 );
 
-                var books = conn.Query<Book>(template.RawSql, template.Parameters).ToList();
-
-                return new PagedBookResource
-                {
-                    Records = books,
-                    TotalCount = totalCount,
-                    Offset = offset,
-                    PageSize = pageSize
-                };
+                pageIds = conn.Query<int>(template.RawSql, template.Parameters).ToList();
             }
+
+            return new PagedBookResource
+            {
+                Records = GetBooksInIdOrder(pageIds),
+                TotalCount = totalCount,
+                Offset = offset,
+                PageSize = pageSize
+            };
+        }
+
+        // Tolerates books deleted between the ID query and this one; they're simply left out.
+        private List<Book> GetBooksInIdOrder(List<int> ids)
+        {
+            if (ids.Count == 0)
+            {
+                return new List<Book>();
+            }
+
+            var idsArray = ids.ToArray();
+            var booksById = Query(Builder().Where<Book>(x => Enumerable.Contains(idsArray, x.Id)))
+                .ToDictionary(book => book.Id);
+
+            var books = new List<Book>(ids.Count);
+            foreach (var id in ids)
+            {
+                if (booksById.TryGetValue(id, out var book))
+                {
+                    books.Add(book);
+                }
+            }
+
+            return books;
         }
 
         public PagedBookResource GetBooksPaged(int offset, int pageSize, string sortKey, string sortDirection, bool includeUnmonitored = false, string mediaType = null, bool? downloaded = null)
