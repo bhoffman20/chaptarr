@@ -112,15 +112,18 @@ class BookIndexTable extends Component {
       isEditorActive,
       selectedState,
       rowCount,
+      dataVersion,
       onRowsRendered
     } = this.props;
 
-    // Paged lists know the full row count before every page has loaded.
+    // Paged lists know the full row count before every page has loaded. dataVersion changes
+    // with the loaded books so the grid redraws rows when they're edited.
     const pagedProps = onRowsRendered ?
       {
         rowCount,
-        onSectionRendered: ({ rowStartIndex, rowStopIndex }) => {
-          onRowsRendered({ startIndex: rowStartIndex, stopIndex: rowStopIndex });
+        dataVersion,
+        onSectionRendered: ({ rowOverscanStartIndex, rowOverscanStopIndex }) => {
+          onRowsRendered({ startIndex: rowOverscanStartIndex, stopIndex: rowOverscanStopIndex });
         }
       } :
       {};
@@ -177,6 +180,7 @@ BookIndexTable.propTypes = {
   isEditorActive: PropTypes.bool.isRequired,
   rowCount: PropTypes.number,
   getBookAtIndex: PropTypes.func,
+  dataVersion: PropTypes.number,
   scrollToIndex: PropTypes.number,
   onRowsRendered: PropTypes.func
 };

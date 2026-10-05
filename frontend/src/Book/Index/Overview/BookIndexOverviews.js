@@ -216,11 +216,11 @@ class BookIndexOverviews extends Component {
   //
   // Listeners
 
-  onSectionRendered = ({ rowStartIndex, rowStopIndex }) => {
+  onSectionRendered = ({ rowOverscanStartIndex, rowOverscanStopIndex }) => {
     const { onRowsRendered } = this.props;
 
     if (onRowsRendered) {
-      onRowsRendered({ startIndex: rowStartIndex, stopIndex: rowStopIndex });
+      onRowsRendered({ startIndex: rowOverscanStartIndex, stopIndex: rowOverscanStopIndex });
     }
   };
 
@@ -237,7 +237,8 @@ class BookIndexOverviews extends Component {
       isSmallScreen,
       scroller,
       rowCount,
-      getBookAtIndex
+      getBookAtIndex,
+      dataVersion
     } = this.props;
 
     const {
@@ -267,6 +268,7 @@ class BookIndexOverviews extends Component {
                   columnCount={1}
                   columnWidth={width}
                   rowCount={getBookAtIndex ? rowCount : items.length}
+                  dataVersion={dataVersion}
                   rowHeight={rowHeight}
                   width={width}
                   onScroll={onChildScroll}
@@ -304,6 +306,7 @@ BookIndexOverviews.propTypes = {
   isEditorActive: PropTypes.bool.isRequired,
   rowCount: PropTypes.number,
   getBookAtIndex: PropTypes.func,
+  dataVersion: PropTypes.number,
   scrollToIndex: PropTypes.number,
   onRowsRendered: PropTypes.func
 };
