@@ -287,6 +287,26 @@ namespace Chaptarr.Core.Test.Books
         }
 
         [Test]
+        public void paged_books_should_keep_sort_order_across_pages()
+        {
+            WithRepository(sut =>
+            {
+                var pages = new[] { 0, 3, 6 }
+                    .Select(offset => sut.GetBooksPaged(
+                        offset: offset,
+                        pageSize: 3,
+                        sortKey: "sizeOnDisk",
+                        sortDirection: "DESC",
+                        includeUnmonitored: true))
+                    .ToList();
+
+                Assert.That(pages.Select(page => page.TotalCount), Is.All.EqualTo(8));
+                Assert.That(pages.SelectMany(page => page.Records).Select(book => book.Id),
+                    Is.EqualTo(new[] { 8, 4, 3, 7, 6, 5, 2, 1 }));
+            });
+        }
+
+        [Test]
         public void paged_author_sort_should_work_with_the_monitored_filter()
         {
             WithRepository(sut =>
